@@ -1,0 +1,10 @@
+{
+  "id": "ical-dump",
+  "name": "Caldump",
+  "version": "1.0.0",
+  "minAppVersion": "0.15.0",
+  "description": "Dump events from your ical to obsidian",
+  "author": "V4ndn",
+  "authorUrl": "https://github.com/v4ndn",
+  "isDesktopOnly": false
+}
