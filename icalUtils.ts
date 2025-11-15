@@ -12,6 +12,9 @@ export interface Task {
   description?: string;
   isRecurring: boolean;
   type: "VTODO" | "VEVENT";
+  uid?: string;
+  recurrenceId?: string;
+  isException?: boolean;
 }
 
 async function fetchICalFromUrl(url: string): Promise<string> {
@@ -82,16 +85,39 @@ function parseTasksForToday(icalData: string, targetDate: Date): Task[] {
   const dayEnd = new Date(dayStart);
   dayEnd.setDate(dayEnd.getDate() + 1);
 
+  // Track recurring events and their exceptions
+  const recurringEvents = new Map<string, ICAL.Component>();
+  const exceptionEvents = new Map<string, ICAL.Component>();
+
+  // First pass: separate recurring events and exceptions
+  for (let i = 0; i < vevents.length; i++) {
+    const vevent = vevents[i];
+    const event = new ICAL.Event(vevent);
+    const uid = event.uid;
+    
+    if (!uid) continue;
+
+    const recurrenceId = vevent.getFirstPropertyValue("recurrence-id");
+    
+    if (recurrenceId) {
+      // This is an exception (rearranged occurrence)
+      exceptionEvents.set(uid + "_" + recurrenceId.toString(), vevent);
+    } else if (vevent.getFirstPropertyValue("rrule")) {
+      // This is a recurring event
+      recurringEvents.set(uid, vevent);
+    }
+  }
+
   // Process VTODOs
   for (let i = 0; i < vtodos.length; i++) {
     const vtodo = vtodos[i];
-    processComponent(vtodo, "VTODO", tasksForToday, targetDate, dayEnd);
+    processComponent(vtodo, "VTODO", tasksForToday, targetDate, dayEnd, recurringEvents, exceptionEvents);
   }
 
-  // Process VEVENTs (some calendar apps store tasks as events)
+  // Process VEVENTs
   for (let i = 0; i < vevents.length; i++) {
     const vevent = vevents[i];
-    processComponent(vevent, "VEVENT", tasksForToday, targetDate, dayEnd);
+    processComponent(vevent, "VEVENT", tasksForToday, targetDate, dayEnd, recurringEvents, exceptionEvents);
   }
 
   return tasksForToday;
@@ -102,7 +128,9 @@ function processComponent(
   type: "VTODO" | "VEVENT",
   tasksForToday: Task[],
   targetDate: Date,
-  dayEnd: Date
+  dayEnd: Date,
+  recurringEvents: Map<string, ICAL.Component>,
+  exceptionEvents: Map<string, ICAL.Component>
 ): void {
   const event = new ICAL.Event(component);
 
@@ -110,6 +138,7 @@ function processComponent(
   const statusValue = component.getFirstPropertyValue("status");
   const status = typeof statusValue === "string" ? statusValue : "NEEDS-ACTION";
   const description = event.description || "";
+  const uid = event.uid;
 
   // Check for due date (DUE property - for VTODO)
   const due = component.getFirstPropertyValue("due");
@@ -135,12 +164,46 @@ function processComponent(
     endDate = dtend.toJSDate();
   }
 
+  // Check if this is an exception (rearranged occurrence)
+  const recurrenceIdProp = component.getFirstPropertyValue("recurrence-id");
+  let recurrenceId: string | null = null;
+  let isException = false;
+
+  if (recurrenceIdProp && recurrenceIdProp instanceof ICAL.Time) {
+    recurrenceId = recurrenceIdProp.toString();
+    isException = true;
+  }
+
   // Check if task/event is recurring
   const rrule = component.getFirstPropertyValue("rrule");
   const isRecurring = !!rrule;
 
-  // Handle recurring items
-  if (isRecurring && rrule) {
+  // For exceptions, check if they occur on the target date
+  if (isException && recurrenceId && uid) {
+    const exceptionKey = uid + "_" + recurrenceId;
+    const exceptionDate = recurrenceIdProp.toJSDate();
+    
+    if (isSameDay(exceptionDate, targetDate)) {
+      // This rearranged occurrence is for today - add it
+      tasksForToday.push({
+        summary,
+        dueDate,
+        startDate,
+        endDate,
+        status,
+        description,
+        isRecurring: true, // It's still technically recurring, just modified
+        type,
+        uid,
+        recurrenceId,
+        isException: true
+      });
+    }
+    return; // Don't process exceptions as regular events
+  }
+
+  // Handle recurring items (only if not an exception)
+  if (isRecurring && rrule && !isException) {
     const baseTime =
       dtstart instanceof ICAL.Time
         ? dtstart
@@ -166,7 +229,12 @@ function processComponent(
           break;
         }
 
-        if (isSameDay(occurrenceDate, targetDate)) {
+        // Check if there's an exception for this occurrence
+        const occurrenceKey = uid + "_" + next.toString();
+        const hasException = exceptionEvents.has(occurrenceKey);
+
+        if (isSameDay(occurrenceDate, targetDate) && !hasException) {
+          // Only add if no exception exists for this date
           tasksForToday.push({
             summary,
             dueDate: occurrenceDate,
@@ -176,13 +244,14 @@ function processComponent(
             description,
             isRecurring: true,
             type,
+            uid
           });
           foundToday = true;
         }
       }
     }
-  } else {
-    // Non-recurring item - check if it's the target date
+  } else if (!isException) {
+    // Non-recurring item (and not an exception) - check if it's the target date
     const relevantDate = dueDate || startDate || endDate;
 
     if (relevantDate && isSameDay(relevantDate, targetDate)) {
@@ -195,10 +264,10 @@ function processComponent(
         description,
         isRecurring: false,
         type,
+        uid
       });
     } else if (!relevantDate && type === "VTODO") {
       // VTODOs without dates might still be active tasks
-
       tasksForToday.push({
         summary,
         dueDate: null,
@@ -208,9 +277,28 @@ function processComponent(
         description,
         isRecurring: false,
         type,
+        uid
       });
     }
   }
+}
+
+function sortTasksByStartTime(tasks: Task[]): Task[] {
+  return tasks.sort((a, b) => {
+    // Handle tasks with no start date - put them at the end
+    if (!a.startDate && !b.startDate) {
+      return 0; // Both have no start date, keep original order
+    }
+    if (!a.startDate) {
+      return 1; // a has no start date, put it after b
+    }
+    if (!b.startDate) {
+      return -1; // b has no start date, put a before b
+    }
+    
+    // Both have start dates, compare them
+    return a.startDate.getTime() - b.startDate.getTime();
+  });
 }
 
 export default async function getTasks(
@@ -221,13 +309,7 @@ export default async function getTasks(
   targetDate.setHours(0, 0, 0, 0);
   const icalData = await fetchICalFromUrl(icalUrl);
   const tasks = parseTasksForToday(icalData, targetDate);
-  tasks.sort((a, b) => {
-    if (a.dueDate && b.dueDate) {
-      return moment(a.dueDate).diff(moment(b.dueDate));
-    } else {
-      return 1;
-    }
-  });
-  console.log(tasks);
-  return tasks;
+  const sortedTasks = sortTasksByStartTime(tasks);
+  console.log(sortedTasks);
+  return sortedTasks;
 }
